@@ -1,0 +1,50 @@
+# Build artifacts
+*.o
+*.a
+*.so
+*.out
+*.exe
+
+# Dependency files
+*.d
+
+# Coverage
+*.gcda
+*.gcno
+*.info
+coverage/
+lcov.info
+
+# Build directories
+build/
+bin/
+
+# Benchmark outputs
+benchmarks/results/
+benchmarks/*.csv
+benchmarks/*.png
+
+# Logs
+*.log
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Valgrind
+valgrind.log
+
+# Editors
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Vim
+*.swp
+*.swo
+
+# Temporary files
+tmp/
