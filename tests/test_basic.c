@@ -1,8 +1,5 @@
 /*
- * tests/test_basic.c — Smoke tests for the public allocator API.
- *
- * Tests are written to pass against stub returns (NULL) and become
- * meaningful once the implementation is filled in.
+ * tests/test_basic.c — smokes
  */
 
 #include <string.h>

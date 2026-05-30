@@ -1,5 +1,5 @@
 /*
- * tests/harness.h — Minimal unit-test harness.
+ * tests/harness.h
  *
  * Usage:
  *   int main(void) {

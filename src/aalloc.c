@@ -1,23 +1,5 @@
 /*
  * aalloc.c
- *
- * Heap allocator: segregated free lists + boundary-tag coalescing.
- *
- * Every live block on the heap has a two-word header (info | span).
- * info packs the block size into the upper bits and a 2-bit tag into
- * the lower bits.  span records the size of the preceding block so
- * the left neighbour can be found in O(1) without an extra pointer.
- *
- * Free blocks carry forward/backward pointers that occupy the same
- * eight bytes the caller would use for data — those two fields share
- * a union.
- *
- * Bins are indexed by usable size / 8.  Bin 0 holds 8-byte blocks,
- * bin 58 is a catch-all for anything larger.
- *
- * Milestones that land here later:
- *   - Thread-local arenas (see LOCK / UNLOCK and the TODO below)
- *   - Slab allocator for small objects (see slab section)
  */
 
 #include <stddef.h>
@@ -31,441 +13,376 @@
 
 #include "aalloc.h"
 
-/* =========================================================================
- * Block layout
- * =========================================================================
- *
- *  [ info ][ span ][ fd | bk  (free) / body (alloc) ]
- *
- *  info  bits 63..2  block size (8-byte aligned, so bits 1:0 are free)
- *        bits  1..0  tag: TAG_FREE | TAG_ALLOC | TAG_GUARD
- *
- *  span  size of the block to the left in memory; lets us walk backwards
- *        in O(1) for coalescing without a second pointer
- */
 
-typedef struct blk {
-    size_t info;
-    size_t span;
+typedef struct header {
+    size_t size_state;
+    size_t left_size;
     union {
-        struct { struct blk *fd; struct blk *bk; };
-        char body[0];
+        struct { struct header *next; struct header *prev; };
+        char data[0];
     };
-} blk_t;
+} header;
 
-/* Block tags stored in info bits 1:0 */
-#define TAG_FREE   0
-#define TAG_ALLOC  1
-#define TAG_GUARD  2
+enum state { UNALLOCATED = 0, ALLOCATED = 1, FENCEPOST = 2 };
 
-/* Bytes consumed by info + span; fd/bk overlap with user data */
-#define OVERHEAD   (sizeof(blk_t) - 2 * sizeof(blk_t *))
+/* Bytes of always-present metadata (size_state + left_size).
+ * next/prev live in the same space as user data. */
+#define ALLOC_HEADER_SIZE  (sizeof(header) - 2 * sizeof(header *))
 
-/* Accessors — size and tag packed into one word */
-#define SZ(b)          ((b)->info & ~(size_t)3)
-#define TAG(b)         ((int)((b)->info & 3))
-#define SET_SZ(b,s)    ((b)->info = (s)  | ((b)->info & 3))
-#define SET_TAG(b,t)   ((b)->info = ((b)->info & ~(size_t)3) | (size_t)(t))
+/* Packed-field accessors */
+#define get_size(h)          ((h)->size_state & ~(size_t)3)
+#define set_size(h, s)       ((h)->size_state = (s) | ((h)->size_state & 3))
+#define get_state(h)         ((enum state)((h)->size_state & 3))
+#define set_state(h, s)      ((h)->size_state = ((h)->size_state & ~(size_t)3) | (size_t)(s))
 
-/* Walk to adjacent blocks */
-#define NEXT(b)        ((blk_t *)((char *)(b) + SZ(b)))
-#define PREV(b)        ((blk_t *)((char *)(b) - (b)->span))
+/* Walk to adjacent blocks in memory */
+#define get_right_header(h)  ((header *)((char *)(h) + get_size(h)))
+#define get_left_header(h)   ((header *)((char *)(h) - (h)->left_size))
 
-/* Strip OVERHEAD from a user pointer to reach the block header */
-#define HDR(p)         ((blk_t *)((char *)(p) - OVERHEAD))
+/* Recover the block header from a user-facing pointer */
+#define ptr_to_header(p)     ((header *)((char *)(p) - ALLOC_HEADER_SIZE))
 
-/* =========================================================================
- * Allocator constants
- * ========================================================================= */
-
-#ifndef HEAP_CHUNK
-#  define HEAP_CHUNK  4096   /* bytes requested per sbrk call       */
+#ifndef ARENA_SIZE
+#  define ARENA_SIZE  4096
 #endif
 
-#define NUM_BINS   59        /* segregated bins; bin 58 = catch-all */
-#define MAX_SEGS   1024      /* OS segments we track for audit      */
+#ifndef N_LISTS
+#  define N_LISTS  59
+#endif
 
-/* =========================================================================
- * Global heap state
- *
- * All mutable allocator state lives in one struct so it is easy to swap
- * in a per-arena version for thread-local allocation (Milestone 2).
- * ========================================================================= */
+#define MAX_OS_CHUNKS  1024
 
-static struct heap {
-    blk_t  bins[NUM_BINS]; /* free-list sentinels, one ring per bin */
-    blk_t *frontier;       /* right guard of the most recent segment */
-    void  *origin;         /* base address for offset printing      */
-    blk_t *segs[MAX_SEGS]; /* left guard of every OS segment        */
-    size_t nseg;
-} H;
+static struct {
+    header  freelistSentinels[N_LISTS]; /* one circular ring per size class  */
+    header *lastFencePost;              /* right fencepost of newest chunk    */
+    void   *base;                       /* base of heap for offset printing   */
+    header *osChunkList[MAX_OS_CHUNKS]; /* left fencepost of each OS segment  */
+    size_t  numOsChunks;
+} heap;
 
-static bool heap_ready = false;
+static bool isMallocInitialized = false;
 
 /* -------------------------------------------------------------------------
  * TODO Milestone 2 — thread-local arenas
  *
- * Replace the global lock below with per-arena mutexes.
- * Each thread should acquire its own heap_t from a pool,
- * eliminating contention on the malloc fast path.
+ * Replace the single mutex with per-arena locks and a thread-local pointer
+ * to an arena.  The heap struct above becomes the per-arena type.
  * ------------------------------------------------------------------------- */
-static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK()    pthread_mutex_lock(&global_lock)
-#define UNLOCK()  pthread_mutex_unlock(&global_lock)
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK()    pthread_mutex_lock(&mutex)
+#define UNLOCK()  pthread_mutex_unlock(&mutex)
 
 /* -------------------------------------------------------------------------
- * TODO Milestone 3 — slab allocator
+ * TODO Milestone 3 — slab allocator for small objects
  *
- * For requests below a threshold (e.g. 256 bytes), bypass the segregated
- * lists and serve from a per-size-class slab.  Hook in here:
+ * For requests at or below a threshold, bypass the segregated lists:
  *
- *   if (size <= SLAB_MAX) return slab_alloc(size);
+ *   if (raw_size <= SLAB_MAX) return slab_alloc(raw_size);
  * ------------------------------------------------------------------------- */
 
-/* =========================================================================
- * Heap growth
- *
- * Maps one HEAP_CHUNK from the OS, installs guard blocks at both ends,
- * and returns the single usable block in between.
- * ========================================================================= */
+static header *allocate_chunk(size_t size);   /* forward declaration */
 
-/*
- * grow_heap — map one HEAP_CHUNK from the OS, install guards at both ends,
- * and return the interior block.  Does NOT insert into any free list or
- * segment tracker — the caller decides both, since adjacency determines
- * whether the new segment is independent or merged with the previous one.
- */
-static blk_t *grow_heap(void) {
-    void *raw = sbrk((intptr_t)HEAP_CHUNK);
-    if (raw == (void *)-1) return NULL;
-
-    blk_t *lg  = (blk_t *)raw;
-    lg->info   = (size_t)TAG_GUARD | OVERHEAD;
-    lg->span   = OVERHEAD;
-
-    blk_t *blk = (blk_t *)((char *)raw + OVERHEAD);
-    blk->info  = (HEAP_CHUNK - 2 * OVERHEAD) | TAG_FREE;
-    blk->span  = OVERHEAD;
-
-    blk_t *rg  = (blk_t *)((char *)raw + HEAP_CHUNK - OVERHEAD);
-    rg->info   = (size_t)TAG_GUARD | OVERHEAD;
-    rg->span   = HEAP_CHUNK - 2 * OVERHEAD;
-
-    return blk;
+static inline void set_fencepost(header *fp, size_t left_size) {
+    set_state(fp, FENCEPOST);
+    set_size(fp, ALLOC_HEADER_SIZE);
+    fp->left_size = left_size;
 }
 
-/* =========================================================================
- * User-written allocator logic
- *
- * The six functions below are the core of the allocator.  The surrounding
- * infrastructure (block layout, heap growth, bin indexing, verification)
- * is written fresh; these six are the work done in the implementation.
- * ========================================================================= */
+static inline void place_fenceposts(void *raw, size_t size) {
+    char *mem = (char *)raw;
+    header *lf = (header *)mem;
+    set_fencepost(lf, ALLOC_HEADER_SIZE);
 
-/*
- * bin_for — map usable byte count to a segregated bin index.
- *
- * All block sizes are multiples of 8, so dividing by 8 gives a dense
- * index starting at 0.  Anything past bin 57 lands in the catch-all.
- */
-static size_t bin_for(size_t usable) {
-    size_t idx = usable / 8 - 1;
-    if (idx > NUM_BINS - 1)
-        idx = NUM_BINS - 1;
-    return idx;
+    header *rf = (header *)(mem + size - ALLOC_HEADER_SIZE);
+    set_fencepost(rf, size - 2 * ALLOC_HEADER_SIZE);
+}
+
+
+static size_t find_freelist_idx(size_t allocable_size) {
+    size_t freelist_idx = allocable_size / 8 - 1;
+    if (freelist_idx > N_LISTS - 1)
+        freelist_idx = N_LISTS - 1;
+    return freelist_idx;
+}
+
+static void insert_into_freelist(header *sentinel, header *block_to_insert) {
+    block_to_insert->next = sentinel->next;
+    block_to_insert->prev = sentinel;
+    sentinel->next->prev  = block_to_insert;
+    sentinel->next        = block_to_insert;
+}
+
+static void remove_from_freelist(header *block) {
+    block->prev->next = block->next;
+    block->next->prev = block->prev;
 }
 
 /*
- * list_push — prepend blk into the free list rooted at sentinel.
+ * allocate_chunk — map ARENA_SIZE bytes from the OS, install fenceposts,
+ * and return the usable block between them.
  */
-static void list_push(blk_t *sentinel, blk_t *blk) {
-    blk->fd = sentinel->fd;
-    blk->bk = sentinel;
-    sentinel->fd->bk = blk;
-    sentinel->fd = blk;
+static header *allocate_chunk(size_t size) {
+    void *mem = sbrk((intptr_t)size);
+
+    place_fenceposts(mem, size);
+    header *hdr = (header *)((char *)mem + ALLOC_HEADER_SIZE);
+    set_state(hdr, UNALLOCATED);
+    set_size(hdr, size - 2 * ALLOC_HEADER_SIZE);
+    hdr->left_size = ALLOC_HEADER_SIZE;
+    return hdr;
 }
 
 /*
- * list_drop — unlink blk from whatever list it currently sits in.
- */
-static void list_drop(blk_t *blk) {
-    blk->bk->fd = blk->fd;
-    blk->fd->bk = blk->bk;
-}
-
-/*
- * find_fit — search the segregated bins for a block of at least total_size
- * bytes, growing the heap as needed.
+ * find_block_to_allocate — scan the segregated lists for a block of at least
+ * total_block_size bytes, extending the heap with allocate_chunk as needed.
  *
- * Starting at naive_bin, walk upward until a non-empty bin is found.
- * Fixed-size bins: take the head directly.
- * Catch-all bin (58): scan for a block large enough.
- *
- * When every bin is empty, call grow_heap.  If the new segment is
- * adjacent to the previous one, reclaim the two guard blocks as usable
- * space — either by absorbing them into an existing free block at the
- * segment boundary, or by bridging the gap directly.
+ * When extending, if the new chunk is adjacent to the previous one, the two
+ * fenceposts between them are reclaimed as usable space — either by growing
+ * an existing free block at the boundary or by bridging across the gap.
  */
-static blk_t *find_fit(size_t naive_bin, size_t total_size) {
-    size_t idx = naive_bin;
-    while (idx < NUM_BINS) {
-        blk_t *sentinel = &H.bins[idx];
-        if (sentinel->fd != sentinel)
+static header *find_block_to_allocate(size_t naive_freelist_idx, size_t total_block_size) {
+    size_t freelist_idx = naive_freelist_idx;
+    while (freelist_idx < N_LISTS) {
+        header *freelist = &heap.freelistSentinels[freelist_idx];
+        if (freelist->next != freelist)
             break;
-        idx++;
+        freelist_idx++;
     }
 
-    blk_t *found = NULL;
+    header *block_to_allocate = NULL;
 
-    if (idx < NUM_BINS) {
-        blk_t *sentinel = &H.bins[idx];
-        if (idx < NUM_BINS - 1) {
-            found = sentinel->fd;
+    if (freelist_idx < N_LISTS) {
+        header *sentinel = &heap.freelistSentinels[freelist_idx];
+        if (freelist_idx < N_LISTS - 1) {
+            block_to_allocate = sentinel->next;
         } else {
-            blk_t *cur = sentinel->fd;
-            while (cur != sentinel && SZ(cur) < total_size)
-                cur = cur->fd;
+            header *cur = sentinel->next;
+            while (cur != sentinel && get_size(cur) < total_block_size)
+                cur = cur->next;
             if (cur != sentinel)
-                found = cur;
+                block_to_allocate = cur;
         }
     }
 
-    while (found == NULL) {
-        blk_t *saved_frontier = H.frontier;
-        blk_t *fresh          = grow_heap();
-        blk_t *new_frontier   = NEXT(fresh);
+    while (block_to_allocate == NULL) {
+        header *saved_last_fp = heap.lastFencePost;
+        header *fresh_chunk   = allocate_chunk(ARENA_SIZE);
+        header *new_right_fp  = get_right_header(fresh_chunk);
 
-        if ((char *)fresh - OVERHEAD == (char *)saved_frontier + OVERHEAD) {
-            /*
-             * Adjacent segment: absorb the two guard blocks between the
-             * chunks as usable heap space, eliminating 2*OVERHEAD of waste.
-             *
-             * Two sub-cases depending on whether the block just before the
-             * old right guard is free (coalesce) or allocated (bridge).
-             *
-             * In either case the new segment's left guard is NOT registered
-             * in H.segs — it is interior to the combined segment, so the
-             * auditor must not try to walk from it independently.
-             */
-            blk_t *prev = PREV(saved_frontier);
+        if ((char *)fresh_chunk - ALLOC_HEADER_SIZE ==
+            (char *)saved_last_fp + ALLOC_HEADER_SIZE) {
 
-            if (TAG(prev) == TAG_FREE) {
-                /* Grow prev across both guards and the fresh interior. */
-                list_drop(prev);
-                size_t merged = SZ(prev) + 2 * OVERHEAD + SZ(fresh);
-                SET_SZ(prev, merged);
-                new_frontier->span = merged;
-                list_push(&H.bins[bin_for(merged - OVERHEAD)], prev);
+            header *prev = get_left_header(saved_last_fp);
+
+            if (get_state(prev) == UNALLOCATED) {
+                remove_from_freelist(prev);
+                size_t new_size = get_size(prev)
+                                + 2 * ALLOC_HEADER_SIZE
+                                + get_size(fresh_chunk);
+                set_size(prev, new_size);
+                new_right_fp->left_size = new_size;
+                size_t new_idx = find_freelist_idx(new_size - ALLOC_HEADER_SIZE);
+                insert_into_freelist(&heap.freelistSentinels[new_idx], prev);
             } else {
-                /*
-                 * No adjacent free block; reclaim the two guards as a new
-                 * free block starting at saved_frontier.
-                 */
-                blk_t *bridge     = saved_frontier;
-                size_t bridged_sz = 2 * OVERHEAD + SZ(fresh);
-                SET_SZ(bridge, bridged_sz);
-                SET_TAG(bridge, TAG_FREE);
-                new_frontier->span = bridged_sz;   /* keep boundary tag consistent */
-                list_push(&H.bins[bin_for(bridged_sz - OVERHEAD)], bridge);
+                header *bridge    = saved_last_fp;
+                size_t bridge_sz  = 2 * ALLOC_HEADER_SIZE + get_size(fresh_chunk);
+                set_size(bridge, bridge_sz);
+                set_state(bridge, UNALLOCATED);
+                new_right_fp->left_size = bridge_sz;
+                insert_into_freelist(
+                    &heap.freelistSentinels[find_freelist_idx(bridge_sz - ALLOC_HEADER_SIZE)],
+                    bridge);
             }
         } else {
-            /* Non-adjacent: register as an independent segment. */
-            blk_t *lg = (blk_t *)((char *)fresh - OVERHEAD);
-            if (H.nseg < MAX_SEGS)
-                H.segs[H.nseg++] = lg;
-            list_push(&H.bins[bin_for(SZ(fresh) - OVERHEAD)], fresh);
+            header *left_fp = (header *)((char *)fresh_chunk - ALLOC_HEADER_SIZE);
+            if (heap.numOsChunks < MAX_OS_CHUNKS)
+                heap.osChunkList[heap.numOsChunks++] = left_fp;
+            insert_into_freelist(
+                &heap.freelistSentinels[find_freelist_idx(
+                    get_size(fresh_chunk) - ALLOC_HEADER_SIZE)],
+                fresh_chunk);
         }
 
-        H.frontier = new_frontier;
-        found = find_fit(naive_bin, total_size);
+        heap.lastFencePost = new_right_fp;
+        block_to_allocate  = find_block_to_allocate(naive_freelist_idx, total_block_size);
     }
 
-    return found;
+    return block_to_allocate;
 }
 
 /*
- * cut_block — remove candidate from its bin, split off the requested
- * total_size from the high end, and return the remainder to the
- * appropriate bin (skipping the remove+reinsert when the bin stays the same).
+ * allocate_block — remove candidate from its free list, split off
+ * total_request_size bytes from the high end, return the remainder to
+ * the appropriate list (skipping the remove+reinsert when the bin is unchanged).
  */
-static blk_t *cut_block(blk_t *candidate, size_t total_size) {
-    size_t blk_sz  = SZ(candidate);
-    size_t rem_sz  = blk_sz - total_size;
+static header *allocate_block(header *block_to_allocate, size_t total_request_size) {
+    size_t block_size     = get_size(block_to_allocate);
+    size_t remainder_size = block_size - total_request_size;
 
-    size_t old_idx = bin_for(blk_sz  - OVERHEAD);
-    size_t rem_idx = bin_for(rem_sz  - OVERHEAD);
+    size_t old_idx = find_freelist_idx(block_size     - ALLOC_HEADER_SIZE);
+    size_t rem_idx = find_freelist_idx(remainder_size - ALLOC_HEADER_SIZE);
 
-    if (blk_sz >= total_size && rem_sz < sizeof(blk_t)) {
-        list_drop(candidate);
-        SET_TAG(candidate, TAG_ALLOC);
-        return candidate;
+    if (block_size >= total_request_size && remainder_size < sizeof(header)) {
+        remove_from_freelist(block_to_allocate);
+        set_state(block_to_allocate, ALLOCATED);
+        return block_to_allocate;
     }
 
     if (old_idx != rem_idx) {
-        list_drop(candidate);
-        SET_SZ(candidate, rem_sz);
-        list_push(&H.bins[rem_idx], candidate);
+        remove_from_freelist(block_to_allocate);
+        set_size(block_to_allocate, remainder_size);
+        insert_into_freelist(&heap.freelistSentinels[rem_idx], block_to_allocate);
     } else {
-        SET_SZ(candidate, rem_sz);
+        set_size(block_to_allocate, remainder_size);
     }
 
-    blk_t *alloc = (blk_t *)((char *)candidate + rem_sz);
-    SET_SZ(alloc, total_size);
-    SET_TAG(alloc, TAG_ALLOC);
-    alloc->span = rem_sz;
+    header *usable_block = get_right_header(block_to_allocate);
+    set_size(usable_block, total_request_size);
+    set_state(usable_block, ALLOCATED);
+    usable_block->left_size = remainder_size;
 
-    NEXT(alloc)->span = total_size;
+    get_right_header(usable_block)->left_size = total_request_size;
 
-    return alloc;
+    return usable_block;
 }
 
 /*
- * merge_free — coalesce blk with its immediate neighbours and insert the
- * merged result into the correct bin.
+ * free_block — coalesce free with its left/right neighbours and reinsert
+ * the merged block into the correct free list.
  *
- * Four cases based on left/right neighbour state:
- *   1. both allocated  — insert blk as-is
- *   2. right free      — absorb right into blk
- *   3. left free       — absorb blk into left
- *   4. both free       — absorb all three
+ * Four cases based on neighbour state:
+ *   1. both allocated     — insert free as-is
+ *   2. right unallocated  — absorb right into free
+ *   3. left unallocated   — absorb free into left
+ *   4. both unallocated   — absorb all three
  *
- * When a coalesced block stays in the same bin (old_idx == new_idx),
- * we splice the new free block into the existing list node in-place
+ * Splice optimisation: when the merged block stays in the same list
+ * (old_idx == new_idx), thread the new block into the existing node
  * rather than doing a remove + re-insert.
  */
-static void merge_free(blk_t *blk, blk_t *left, blk_t *right) {
-    int   left_tag = TAG(left);
-    int   right_tag = TAG(right);
-    size_t curr_sz  = SZ(blk);
+static void free_block(header *free, header *left, header *right) {
+    int    left_state  = get_state(left);
+    int    right_state = get_state(right);
+    size_t curr_size   = get_size(free);
 
-    blk_t *result      = blk;
-    bool   skip_insert = false;
+    header *block_to_insert    = free;
+    bool    handled_reinsertion = false;
 
-    if (left_tag != TAG_FREE && right_tag != TAG_FREE) {
+    if (left_state != UNALLOCATED && right_state != UNALLOCATED) {
         /* Case 1 */
-        result = blk;
+        block_to_insert = free;
 
-    } else if (left_tag != TAG_FREE && right_tag == TAG_FREE) {
+    } else if (left_state != UNALLOCATED && right_state == UNALLOCATED) {
         /* Case 2 — absorb right */
-        size_t new_sz  = curr_sz + SZ(right);
-        size_t old_idx = bin_for(SZ(right) - OVERHEAD);
-        size_t new_idx = bin_for(new_sz    - OVERHEAD);
+        size_t new_size = curr_size + get_size(right);
+        size_t old_idx  = find_freelist_idx(get_size(right) - ALLOC_HEADER_SIZE);
+        size_t new_idx  = find_freelist_idx(new_size        - ALLOC_HEADER_SIZE);
 
         if (old_idx != new_idx) {
-            list_drop(right);
+            remove_from_freelist(right);
         } else {
-            blk->fd         = right->fd;
-            blk->bk         = right->bk;
-            blk->fd->bk     = blk;
-            blk->bk->fd     = blk;
-            skip_insert = true;
+            free->next        = right->next;
+            free->prev        = right->prev;
+            free->next->prev  = free;
+            free->prev->next  = free;
+            handled_reinsertion = true;
         }
-        SET_SZ(blk, new_sz);
-        result = blk;
+        set_size(free, new_size);
+        block_to_insert = free;
 
-    } else if (left_tag == TAG_FREE && right_tag != TAG_FREE) {
+    } else if (left_state == UNALLOCATED && right_state != UNALLOCATED) {
         /* Case 3 — absorb into left */
-        size_t new_sz  = SZ(left) + curr_sz;
-        size_t old_idx = bin_for(SZ(left) - OVERHEAD);
-        size_t new_idx = bin_for(new_sz   - OVERHEAD);
+        size_t new_size = get_size(left) + curr_size;
+        size_t old_idx  = find_freelist_idx(get_size(left) - ALLOC_HEADER_SIZE);
+        size_t new_idx  = find_freelist_idx(new_size       - ALLOC_HEADER_SIZE);
 
         if (old_idx != new_idx)
-            list_drop(left);
+            remove_from_freelist(left);
         else
-            skip_insert = true;
+            handled_reinsertion = true;
 
-        SET_SZ(left, new_sz);
-        result = left;
+        set_size(left, new_size);
+        block_to_insert = left;
 
     } else {
         /* Case 4 — absorb left and right */
-        list_drop(right);
+        remove_from_freelist(right);
 
-        size_t new_sz  = SZ(left) + curr_sz + SZ(right);
-        size_t old_idx = bin_for(SZ(left) - OVERHEAD);
-        size_t new_idx = bin_for(new_sz   - OVERHEAD);
+        size_t new_size = get_size(left) + curr_size + get_size(right);
+        size_t old_idx  = find_freelist_idx(get_size(left) - ALLOC_HEADER_SIZE);
+        size_t new_idx  = find_freelist_idx(new_size       - ALLOC_HEADER_SIZE);
 
         if (old_idx != new_idx)
-            list_drop(left);
+            remove_from_freelist(left);
         else
-            skip_insert = true;
+            handled_reinsertion = true;
 
-        SET_SZ(left, new_sz);
-        result = left;
+        set_size(left, new_size);
+        block_to_insert = left;
     }
 
-    SET_TAG(result, TAG_FREE);
-    NEXT(result)->span = SZ(result);
+    set_state(block_to_insert, UNALLOCATED);
+    get_right_header(block_to_insert)->left_size = get_size(block_to_insert);
 
-    if (!skip_insert) {
-        size_t final_idx = bin_for(SZ(result) - OVERHEAD);
-        list_push(&H.bins[final_idx], result);
+    if (!handled_reinsertion) {
+        size_t final_idx = find_freelist_idx(get_size(block_to_insert) - ALLOC_HEADER_SIZE);
+        insert_into_freelist(&heap.freelistSentinels[final_idx], block_to_insert);
     }
 }
 
-/* =========================================================================
- * Heap-level alloc / free
- * ========================================================================= */
+// top level alloc / free
 
-static void *heap_alloc(size_t raw_size) {
+static void *allocate_object(size_t raw_size) {
     if (raw_size == 0)
         return NULL;
 
-    size_t aligned = (raw_size + 7) & ~(size_t)7;
-    size_t total   = aligned + OVERHEAD;
-    if (total < sizeof(blk_t))
-        total = sizeof(blk_t);
+    size_t rounded   = (raw_size + 7) & ~(size_t)7;
+    size_t total     = rounded + ALLOC_HEADER_SIZE;
+    if (total < sizeof(header))
+        total = sizeof(header);
 
-    size_t usable    = total - OVERHEAD;
-    size_t naive_bin = bin_for(usable);
+    size_t allocable   = total - ALLOC_HEADER_SIZE;
+    size_t naive_idx   = find_freelist_idx(allocable);
 
-    blk_t *fit  = find_fit(naive_bin, total);
-    blk_t *blk  = cut_block(fit, total);
+    header *fit        = find_block_to_allocate(naive_idx, total);
+    header *allocated  = allocate_block(fit, total);
 
-    return blk->body;
+    return (void *)((char *)allocated + ALLOC_HEADER_SIZE);
 }
 
-static void heap_free(void *p) {
+static void deallocate_object(void *p) {
     if (p == NULL)
         return;
 
-    blk_t *blk = HDR(p);
+    header *blk = ptr_to_header(p);
 
-    if (TAG(blk) != TAG_ALLOC) {
-        fprintf(stderr, "aalloc: double-free or corrupt block at %p\n", p);
+    if (get_state(blk) != ALLOCATED) {
+        fprintf(stderr, "aalloc: double-free detected at %p\n", p);
         abort();
     }
 
-    SET_TAG(blk, TAG_FREE);
-    merge_free(blk, PREV(blk), NEXT(blk));
+    set_state(blk, UNALLOCATED);
+    free_block(blk, get_left_header(blk), get_right_header(blk));
 }
 
-/* =========================================================================
- * Heap audit
- * ========================================================================= */
 
-/*
- * Check every bin for cycles (Floyd) and broken next/prev links.
- */
-static bool audit_bins(void) {
-    for (int i = 0; i < NUM_BINS; i++) {
-        blk_t *s = &H.bins[i];
+// sanity
 
-        /* Cycle detection */
-        blk_t *slow = s->fd, *fast = s->fd->fd;
-        while (fast != s) {
+static bool verify_freelist(void) {
+    /* Floyd cycle detection across all lists */
+    for (int i = 0; i < N_LISTS; i++) {
+        header *sentinel = &heap.freelistSentinels[i];
+        header *slow = sentinel->next, *fast = sentinel->next->next;
+        for (; fast != sentinel; slow = slow->next, fast = fast->next->next) {
             if (slow == fast) {
-                fprintf(stderr, "aalloc: cycle in bin %d\n", i);
+                fprintf(stderr, "aalloc: cycle in free list %d\n", i);
                 return false;
             }
-            slow = slow->fd;
-            fast = fast->fd->fd;
         }
-
-        /* Link consistency */
-        for (blk_t *cur = s->fd; cur != s; cur = cur->fd) {
-            if (cur->fd->bk != cur || cur->bk->fd != cur) {
-                fprintf(stderr, "aalloc: broken link in bin %d\n", i);
+        /* next/prev consistency */
+        for (header *cur = sentinel->next; cur != sentinel; cur = cur->next) {
+            if (cur->next->prev != cur || cur->prev->next != cur) {
+                fprintf(stderr, "aalloc: broken link in free list %d\n", i);
                 return false;
             }
         }
@@ -473,13 +390,11 @@ static bool audit_bins(void) {
     return true;
 }
 
-/*
- * Walk one segment (from its left guard to its right guard) verifying
- * that each block's size agrees with the following block's span.
- */
-static bool audit_segment(blk_t *lg) {
-    for (blk_t *cur = NEXT(lg); TAG(cur) != TAG_GUARD; cur = NEXT(cur)) {
-        if (SZ(cur) != NEXT(cur)->span) {
+static bool verify_chunk(header *left_fp) {
+    for (header *cur = get_right_header(left_fp);
+         get_state(cur) != FENCEPOST;
+         cur = get_right_header(cur)) {
+        if (get_size(cur) != get_right_header(cur)->left_size) {
             fprintf(stderr, "aalloc: boundary-tag mismatch\n");
             return false;
         }
@@ -487,51 +402,56 @@ static bool audit_segment(blk_t *lg) {
     return true;
 }
 
-static bool audit_heap(void) {
-    for (size_t i = 0; i < H.nseg; i++)
-        if (!audit_segment(H.segs[i]))
+static bool verify_tags(void) {
+    for (size_t i = 0; i < heap.numOsChunks; i++)
+        if (!verify_chunk(heap.osChunkList[i]))
             return false;
-    return audit_bins();
+    return true;
 }
 
-/* =========================================================================
- * Initialiser
- * ========================================================================= */
 
-static void __attribute__((constructor)) heap_init(void) {
-    if (heap_ready) return;
+static void init(void) {
+    if (isMallocInitialized) return;
 
-    for (int i = 0; i < NUM_BINS; i++) {
-        H.bins[i].fd = &H.bins[i];
-        H.bins[i].bk = &H.bins[i];
+    pthread_mutex_init(&mutex, NULL);
+
+    for (int i = 0; i < N_LISTS; i++) {
+        heap.freelistSentinels[i].next = &heap.freelistSentinels[i];
+        heap.freelistSentinels[i].prev = &heap.freelistSentinels[i];
     }
 
-    blk_t *first  = grow_heap();
-    H.frontier    = NEXT(first);
-    H.origin      = (char *)first - OVERHEAD;
+    header *block    = allocate_chunk(ARENA_SIZE);
+    header *left_fp  = (header *)((char *)block - ALLOC_HEADER_SIZE);
 
-    /* Register the first (and so far only) segment for the heap audit. */
-    H.segs[H.nseg++] = (blk_t *)((char *)first - OVERHEAD);
+    if (heap.numOsChunks < MAX_OS_CHUNKS)
+        heap.osChunkList[heap.numOsChunks++] = left_fp;
 
-    list_push(&H.bins[NUM_BINS - 1], first);
+    heap.lastFencePost = get_right_header(block);
+    heap.base          = (char *)block - ALLOC_HEADER_SIZE;
 
-    heap_ready = true;
+    header *sentinel = &heap.freelistSentinels[N_LISTS - 1];
+    sentinel->next = block;
+    sentinel->prev = block;
+    block->next    = sentinel;
+    block->prev    = sentinel;
+
+    isMallocInitialized = true;
 }
 
-/* =========================================================================
- * Public API
- * ========================================================================= */
+static void __attribute__((constructor)) _init_on_load(void) { init(); }
+
+// PUBLIC API
 
 void *aa_malloc(size_t size) {
     LOCK();
-    void *p = heap_alloc(size);
+    void *p = allocate_object(size);
     UNLOCK();
     return p;
 }
 
 void aa_free(void *p) {
     LOCK();
-    heap_free(p);
+    deallocate_object(p);
     UNLOCK();
 }
 
@@ -549,5 +469,5 @@ void *aa_realloc(void *ptr, size_t size) {
 }
 
 bool aa_verify(void) {
-    return audit_heap();
+    return verify_freelist() && verify_tags();
 }

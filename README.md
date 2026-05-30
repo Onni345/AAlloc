@@ -86,14 +86,14 @@ Enables `AALLOC_DEBUG` assertions and disables optimisation.
 | Milestone | Status |
 |-----------|--------|
 | Repository structure | ✓ |
-| Build system | |
-| Public APIs and headers | |
-| Allocator metadata structures | |
-| malloc / calloc | |
-| free | |
-| realloc | |
+| Build system | ✓ |
+| Public APIs and headers | ✓ |
+| Allocator metadata structures | ✓ |
+| malloc / calloc | ✓ |
+| free | ✓ |
+| realloc | ✓ |
 | Arena subsystem | |
-| Slab subsystem | |
-| Statistics subsystem | |
+| Slab subsystem |  |
+| Statistics subsystem |  |
 | Benchmarks | |
 | Documentation | |
