@@ -20,6 +20,7 @@ build/
 bin/
 
 # Benchmark outputs
+bench_results/
 benchmarks/results/
 benchmarks/*.csv
 benchmarks/*.png
