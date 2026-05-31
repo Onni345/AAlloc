@@ -13,10 +13,10 @@
 
 #include "aalloc.h"
 
-
 typedef struct header {
     size_t size_state;
     size_t left_size;
+    struct arena *owner;
     union {
         struct { struct header *next; struct header *prev; };
         char data[0];
@@ -25,21 +25,15 @@ typedef struct header {
 
 enum state { UNALLOCATED = 0, ALLOCATED = 1, FENCEPOST = 2 };
 
-/* Bytes of always-present metadata (size_state + left_size).
- * next/prev live in the same space as user data. */
 #define ALLOC_HEADER_SIZE  (sizeof(header) - 2 * sizeof(header *))
 
-/* Packed-field accessors */
 #define get_size(h)          ((h)->size_state & ~(size_t)3)
 #define set_size(h, s)       ((h)->size_state = (s) | ((h)->size_state & 3))
 #define get_state(h)         ((enum state)((h)->size_state & 3))
 #define set_state(h, s)      ((h)->size_state = ((h)->size_state & ~(size_t)3) | (size_t)(s))
 
-/* Walk to adjacent blocks in memory */
 #define get_right_header(h)  ((header *)((char *)(h) + get_size(h)))
 #define get_left_header(h)   ((header *)((char *)(h) - (h)->left_size))
-
-/* Recover the block header from a user-facing pointer */
 #define ptr_to_header(p)     ((header *)((char *)(p) - ALLOC_HEADER_SIZE))
 
 #ifndef ARENA_SIZE
@@ -52,35 +46,34 @@ enum state { UNALLOCATED = 0, ALLOCATED = 1, FENCEPOST = 2 };
 
 #define MAX_OS_CHUNKS  1024
 
-static struct {
-    header  freelistSentinels[N_LISTS]; /* one circular ring per size class  */
-    header *lastFencePost;              /* right fencepost of newest chunk    */
-    void   *base;                       /* base of heap for offset printing   */
-    header *osChunkList[MAX_OS_CHUNKS]; /* left fencepost of each OS segment  */
-    size_t  numOsChunks;
-} heap;
+#ifndef N_ARENAS
+#  define N_ARENAS  10
+#endif
 
-static bool isMallocInitialized = false;
+typedef struct arena {
+    header          freelistSentinels[N_LISTS];
+    header         *lastFencePost;
+    void           *base;
+    header         *osChunkList[MAX_OS_CHUNKS];
+    size_t          numOsChunks;
+    pthread_mutex_t mutex;
+    bool            initialized;
+} arena_t;
 
-/* -------------------------------------------------------------------------
- * TODO Milestone 2 — thread-local arenas
- *
- * Replace the single mutex with per-arena locks and a thread-local pointer
- * to an arena.  The heap struct above becomes the per-arena type.
- * ------------------------------------------------------------------------- */
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK()    pthread_mutex_lock(&mutex)
-#define UNLOCK()  pthread_mutex_unlock(&mutex)
+static arena_t         arenas[N_ARENAS];
+static size_t          next_arena       = 0;
+static pthread_key_t   arena_key;
+static pthread_mutex_t arena_assign_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t  init_once         = PTHREAD_ONCE_INIT;
 
-/* -------------------------------------------------------------------------
- * TODO Milestone 3 — slab allocator for small objects
- *
- * For requests at or below a threshold, bypass the segregated lists:
- *
+#define LOCK(a)    pthread_mutex_lock(&(a)->mutex)
+#define UNLOCK(a)  pthread_mutex_unlock(&(a)->mutex)
+
+/* ---- TODO Milestone 3: slab allocator hook
  *   if (raw_size <= SLAB_MAX) return slab_alloc(raw_size);
- * ------------------------------------------------------------------------- */
+ * ---- */
 
-static header *allocate_chunk(size_t size);   /* forward declaration */
+static header *allocate_chunk(size_t size);
 
 static inline void set_fencepost(header *fp, size_t left_size) {
     set_state(fp, FENCEPOST);
@@ -90,13 +83,9 @@ static inline void set_fencepost(header *fp, size_t left_size) {
 
 static inline void place_fenceposts(void *raw, size_t size) {
     char *mem = (char *)raw;
-    header *lf = (header *)mem;
-    set_fencepost(lf, ALLOC_HEADER_SIZE);
-
-    header *rf = (header *)(mem + size - ALLOC_HEADER_SIZE);
-    set_fencepost(rf, size - 2 * ALLOC_HEADER_SIZE);
+    set_fencepost((header *)mem, ALLOC_HEADER_SIZE);
+    set_fencepost((header *)(mem + size - ALLOC_HEADER_SIZE), size - 2 * ALLOC_HEADER_SIZE);
 }
-
 
 static size_t find_freelist_idx(size_t allocable_size) {
     size_t freelist_idx = allocable_size / 8 - 1;
@@ -117,13 +106,8 @@ static void remove_from_freelist(header *block) {
     block->next->prev = block->prev;
 }
 
-/*
- * allocate_chunk — map ARENA_SIZE bytes from the OS, install fenceposts,
- * and return the usable block between them.
- */
 static header *allocate_chunk(size_t size) {
     void *mem = sbrk((intptr_t)size);
-
     place_fenceposts(mem, size);
     header *hdr = (header *)((char *)mem + ALLOC_HEADER_SIZE);
     set_state(hdr, UNALLOCATED);
@@ -132,18 +116,10 @@ static header *allocate_chunk(size_t size) {
     return hdr;
 }
 
-/*
- * find_block_to_allocate — scan the segregated lists for a block of at least
- * total_block_size bytes, extending the heap with allocate_chunk as needed.
- *
- * When extending, if the new chunk is adjacent to the previous one, the two
- * fenceposts between them are reclaimed as usable space — either by growing
- * an existing free block at the boundary or by bridging across the gap.
- */
-static header *find_block_to_allocate(size_t naive_freelist_idx, size_t total_block_size) {
+static header *find_block_to_allocate(arena_t *arena, size_t naive_freelist_idx, size_t total_block_size) {
     size_t freelist_idx = naive_freelist_idx;
     while (freelist_idx < N_LISTS) {
-        header *freelist = &heap.freelistSentinels[freelist_idx];
+        header *freelist = &arena->freelistSentinels[freelist_idx];
         if (freelist->next != freelist)
             break;
         freelist_idx++;
@@ -152,7 +128,7 @@ static header *find_block_to_allocate(size_t naive_freelist_idx, size_t total_bl
     header *block_to_allocate = NULL;
 
     if (freelist_idx < N_LISTS) {
-        header *sentinel = &heap.freelistSentinels[freelist_idx];
+        header *sentinel = &arena->freelistSentinels[freelist_idx];
         if (freelist_idx < N_LISTS - 1) {
             block_to_allocate = sentinel->next;
         } else {
@@ -165,7 +141,7 @@ static header *find_block_to_allocate(size_t naive_freelist_idx, size_t total_bl
     }
 
     while (block_to_allocate == NULL) {
-        header *saved_last_fp = heap.lastFencePost;
+        header *saved_last_fp = arena->lastFencePost;
         header *fresh_chunk   = allocate_chunk(ARENA_SIZE);
         header *new_right_fp  = get_right_header(fresh_chunk);
 
@@ -181,41 +157,37 @@ static header *find_block_to_allocate(size_t naive_freelist_idx, size_t total_bl
                                 + get_size(fresh_chunk);
                 set_size(prev, new_size);
                 new_right_fp->left_size = new_size;
-                size_t new_idx = find_freelist_idx(new_size - ALLOC_HEADER_SIZE);
-                insert_into_freelist(&heap.freelistSentinels[new_idx], prev);
+                insert_into_freelist(
+                    &arena->freelistSentinels[find_freelist_idx(new_size - ALLOC_HEADER_SIZE)],
+                    prev);
             } else {
-                header *bridge    = saved_last_fp;
-                size_t bridge_sz  = 2 * ALLOC_HEADER_SIZE + get_size(fresh_chunk);
+                header *bridge   = saved_last_fp;
+                size_t bridge_sz = 2 * ALLOC_HEADER_SIZE + get_size(fresh_chunk);
                 set_size(bridge, bridge_sz);
                 set_state(bridge, UNALLOCATED);
                 new_right_fp->left_size = bridge_sz;
                 insert_into_freelist(
-                    &heap.freelistSentinels[find_freelist_idx(bridge_sz - ALLOC_HEADER_SIZE)],
+                    &arena->freelistSentinels[find_freelist_idx(bridge_sz - ALLOC_HEADER_SIZE)],
                     bridge);
             }
         } else {
             header *left_fp = (header *)((char *)fresh_chunk - ALLOC_HEADER_SIZE);
-            if (heap.numOsChunks < MAX_OS_CHUNKS)
-                heap.osChunkList[heap.numOsChunks++] = left_fp;
+            if (arena->numOsChunks < MAX_OS_CHUNKS)
+                arena->osChunkList[arena->numOsChunks++] = left_fp;
             insert_into_freelist(
-                &heap.freelistSentinels[find_freelist_idx(
+                &arena->freelistSentinels[find_freelist_idx(
                     get_size(fresh_chunk) - ALLOC_HEADER_SIZE)],
                 fresh_chunk);
         }
 
-        heap.lastFencePost = new_right_fp;
-        block_to_allocate  = find_block_to_allocate(naive_freelist_idx, total_block_size);
+        arena->lastFencePost = new_right_fp;
+        block_to_allocate = find_block_to_allocate(arena, naive_freelist_idx, total_block_size);
     }
 
     return block_to_allocate;
 }
 
-/*
- * allocate_block — remove candidate from its free list, split off
- * total_request_size bytes from the high end, return the remainder to
- * the appropriate list (skipping the remove+reinsert when the bin is unchanged).
- */
-static header *allocate_block(header *block_to_allocate, size_t total_request_size) {
+static header *allocate_block(arena_t *arena, header *block_to_allocate, size_t total_request_size) {
     size_t block_size     = get_size(block_to_allocate);
     size_t remainder_size = block_size - total_request_size;
 
@@ -231,7 +203,7 @@ static header *allocate_block(header *block_to_allocate, size_t total_request_si
     if (old_idx != rem_idx) {
         remove_from_freelist(block_to_allocate);
         set_size(block_to_allocate, remainder_size);
-        insert_into_freelist(&heap.freelistSentinels[rem_idx], block_to_allocate);
+        insert_into_freelist(&arena->freelistSentinels[rem_idx], block_to_allocate);
     } else {
         set_size(block_to_allocate, remainder_size);
     }
@@ -240,40 +212,23 @@ static header *allocate_block(header *block_to_allocate, size_t total_request_si
     set_size(usable_block, total_request_size);
     set_state(usable_block, ALLOCATED);
     usable_block->left_size = remainder_size;
-
     get_right_header(usable_block)->left_size = total_request_size;
 
     return usable_block;
 }
 
-/*
- * free_block — coalesce free with its left/right neighbours and reinsert
- * the merged block into the correct free list.
- *
- * Four cases based on neighbour state:
- *   1. both allocated     — insert free as-is
- *   2. right unallocated  — absorb right into free
- *   3. left unallocated   — absorb free into left
- *   4. both unallocated   — absorb all three
- *
- * Splice optimisation: when the merged block stays in the same list
- * (old_idx == new_idx), thread the new block into the existing node
- * rather than doing a remove + re-insert.
- */
-static void free_block(header *free, header *left, header *right) {
+static void free_block(arena_t *arena, header *free, header *left, header *right) {
     int    left_state  = get_state(left);
     int    right_state = get_state(right);
     size_t curr_size   = get_size(free);
 
-    header *block_to_insert    = free;
+    header *block_to_insert     = free;
     bool    handled_reinsertion = false;
 
     if (left_state != UNALLOCATED && right_state != UNALLOCATED) {
-        /* Case 1 */
         block_to_insert = free;
 
     } else if (left_state != UNALLOCATED && right_state == UNALLOCATED) {
-        /* Case 2 — absorb right */
         size_t new_size = curr_size + get_size(right);
         size_t old_idx  = find_freelist_idx(get_size(right) - ALLOC_HEADER_SIZE);
         size_t new_idx  = find_freelist_idx(new_size        - ALLOC_HEADER_SIZE);
@@ -281,17 +236,16 @@ static void free_block(header *free, header *left, header *right) {
         if (old_idx != new_idx) {
             remove_from_freelist(right);
         } else {
-            free->next        = right->next;
-            free->prev        = right->prev;
-            free->next->prev  = free;
-            free->prev->next  = free;
+            free->next       = right->next;
+            free->prev       = right->prev;
+            free->next->prev = free;
+            free->prev->next = free;
             handled_reinsertion = true;
         }
         set_size(free, new_size);
         block_to_insert = free;
 
     } else if (left_state == UNALLOCATED && right_state != UNALLOCATED) {
-        /* Case 3 — absorb into left */
         size_t new_size = get_size(left) + curr_size;
         size_t old_idx  = find_freelist_idx(get_size(left) - ALLOC_HEADER_SIZE);
         size_t new_idx  = find_freelist_idx(new_size       - ALLOC_HEADER_SIZE);
@@ -305,7 +259,6 @@ static void free_block(header *free, header *left, header *right) {
         block_to_insert = left;
 
     } else {
-        /* Case 4 — absorb left and right */
         remove_from_freelist(right);
 
         size_t new_size = get_size(left) + curr_size + get_size(right);
@@ -326,52 +279,89 @@ static void free_block(header *free, header *left, header *right) {
 
     if (!handled_reinsertion) {
         size_t final_idx = find_freelist_idx(get_size(block_to_insert) - ALLOC_HEADER_SIZE);
-        insert_into_freelist(&heap.freelistSentinels[final_idx], block_to_insert);
+        insert_into_freelist(&arena->freelistSentinels[final_idx], block_to_insert);
     }
 }
 
-// top level alloc / free
-
-static void *allocate_object(size_t raw_size) {
+static void *allocate_object(arena_t *arena, size_t raw_size) {
     if (raw_size == 0)
         return NULL;
 
-    size_t rounded   = (raw_size + 7) & ~(size_t)7;
-    size_t total     = rounded + ALLOC_HEADER_SIZE;
+    size_t rounded = (raw_size + 7) & ~(size_t)7;
+    size_t total   = rounded + ALLOC_HEADER_SIZE;
     if (total < sizeof(header))
         total = sizeof(header);
 
-    size_t allocable   = total - ALLOC_HEADER_SIZE;
-    size_t naive_idx   = find_freelist_idx(allocable);
+    size_t allocable = total - ALLOC_HEADER_SIZE;
+    size_t naive_idx = find_freelist_idx(allocable);
 
-    header *fit        = find_block_to_allocate(naive_idx, total);
-    header *allocated  = allocate_block(fit, total);
+    header *fit       = find_block_to_allocate(arena, naive_idx, total);
+    header *allocated = allocate_block(arena, fit, total);
+    allocated->owner  = arena;
 
     return (void *)((char *)allocated + ALLOC_HEADER_SIZE);
 }
 
-static void deallocate_object(void *p) {
-    if (p == NULL)
-        return;
-
-    header *blk = ptr_to_header(p);
-
+static void deallocate_object(arena_t *arena, header *blk) {
     if (get_state(blk) != ALLOCATED) {
-        fprintf(stderr, "aalloc: double-free detected at %p\n", p);
+        fprintf(stderr, "aalloc: double-free detected at %p\n", (void *)blk);
         abort();
     }
-
     set_state(blk, UNALLOCATED);
-    free_block(blk, get_left_header(blk), get_right_header(blk));
+    free_block(arena, blk, get_left_header(blk), get_right_header(blk));
 }
 
+static void init_arena(arena_t *arena) {
+    pthread_mutex_init(&arena->mutex, NULL);
 
-// sanity
-
-static bool verify_freelist(void) {
-    /* Floyd cycle detection across all lists */
     for (int i = 0; i < N_LISTS; i++) {
-        header *sentinel = &heap.freelistSentinels[i];
+        arena->freelistSentinels[i].next = &arena->freelistSentinels[i];
+        arena->freelistSentinels[i].prev = &arena->freelistSentinels[i];
+    }
+
+    header *block   = allocate_chunk(ARENA_SIZE);
+    header *left_fp = (header *)((char *)block - ALLOC_HEADER_SIZE);
+
+    if (arena->numOsChunks < MAX_OS_CHUNKS)
+        arena->osChunkList[arena->numOsChunks++] = left_fp;
+
+    arena->lastFencePost = get_right_header(block);
+    arena->base          = (char *)block - ALLOC_HEADER_SIZE;
+
+    header *sentinel = &arena->freelistSentinels[N_LISTS - 1];
+    sentinel->next = block;
+    sentinel->prev = block;
+    block->next    = sentinel;
+    block->prev    = sentinel;
+
+    arena->initialized = true;
+}
+
+static void global_init(void) {
+    pthread_key_create(&arena_key, NULL);
+}
+
+static arena_t *get_thread_arena(void) {
+    pthread_once(&init_once, global_init);
+
+    arena_t *a = pthread_getspecific(arena_key);
+    if (a != NULL)
+        return a;
+
+    pthread_mutex_lock(&arena_assign_lock);
+    a = &arenas[next_arena++ % N_ARENAS];
+    pthread_mutex_unlock(&arena_assign_lock);
+
+    if (!a->initialized)
+        init_arena(a);
+
+    pthread_setspecific(arena_key, a);
+    return a;
+}
+
+static bool verify_freelist(arena_t *arena) {
+    for (int i = 0; i < N_LISTS; i++) {
+        header *sentinel = &arena->freelistSentinels[i];
         header *slow = sentinel->next, *fast = sentinel->next->next;
         for (; fast != sentinel; slow = slow->next, fast = fast->next->next) {
             if (slow == fast) {
@@ -379,7 +369,6 @@ static bool verify_freelist(void) {
                 return false;
             }
         }
-        /* next/prev consistency */
         for (header *cur = sentinel->next; cur != sentinel; cur = cur->next) {
             if (cur->next->prev != cur || cur->prev->next != cur) {
                 fprintf(stderr, "aalloc: broken link in free list %d\n", i);
@@ -402,57 +391,32 @@ static bool verify_chunk(header *left_fp) {
     return true;
 }
 
-static bool verify_tags(void) {
-    for (size_t i = 0; i < heap.numOsChunks; i++)
-        if (!verify_chunk(heap.osChunkList[i]))
+static bool verify_tags(arena_t *arena) {
+    for (size_t i = 0; i < arena->numOsChunks; i++)
+        if (!verify_chunk(arena->osChunkList[i]))
             return false;
     return true;
 }
 
-
-static void init(void) {
-    if (isMallocInitialized) return;
-
-    pthread_mutex_init(&mutex, NULL);
-
-    for (int i = 0; i < N_LISTS; i++) {
-        heap.freelistSentinels[i].next = &heap.freelistSentinels[i];
-        heap.freelistSentinels[i].prev = &heap.freelistSentinels[i];
-    }
-
-    header *block    = allocate_chunk(ARENA_SIZE);
-    header *left_fp  = (header *)((char *)block - ALLOC_HEADER_SIZE);
-
-    if (heap.numOsChunks < MAX_OS_CHUNKS)
-        heap.osChunkList[heap.numOsChunks++] = left_fp;
-
-    heap.lastFencePost = get_right_header(block);
-    heap.base          = (char *)block - ALLOC_HEADER_SIZE;
-
-    header *sentinel = &heap.freelistSentinels[N_LISTS - 1];
-    sentinel->next = block;
-    sentinel->prev = block;
-    block->next    = sentinel;
-    block->prev    = sentinel;
-
-    isMallocInitialized = true;
+static void __attribute__((constructor)) _init_on_load(void) {
+    pthread_once(&init_once, global_init);
 }
 
-static void __attribute__((constructor)) _init_on_load(void) { init(); }
-
-// PUBLIC API
-
 void *aa_malloc(size_t size) {
-    LOCK();
-    void *p = allocate_object(size);
-    UNLOCK();
+    arena_t *arena = get_thread_arena();
+    LOCK(arena);
+    void *p = allocate_object(arena, size);
+    UNLOCK(arena);
     return p;
 }
 
 void aa_free(void *p) {
-    LOCK();
-    deallocate_object(p);
-    UNLOCK();
+    if (p == NULL) return;
+    header  *blk   = ptr_to_header(p);
+    arena_t *arena = blk->owner;
+    LOCK(arena);
+    deallocate_object(arena, blk);
+    UNLOCK(arena);
 }
 
 void *aa_calloc(size_t nmemb, size_t size) {
@@ -469,5 +433,6 @@ void *aa_realloc(void *ptr, size_t size) {
 }
 
 bool aa_verify(void) {
-    return verify_freelist() && verify_tags();
+    arena_t *arena = get_thread_arena();
+    return verify_freelist(arena) && verify_tags(arena);
 }
